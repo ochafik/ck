@@ -192,7 +192,8 @@ async fn test_mcp_nonexistent_path() {
     assert!(result.is_err());
 
     if let Err(error) = result {
-        assert!(error.to_string().contains("Path does not exist"));
+        // New validation returns "Invalid path" for non-existent paths
+        assert!(error.to_string().contains("Invalid path"));
     }
 }
 

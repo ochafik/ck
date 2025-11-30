@@ -38,6 +38,45 @@ fn filter_valid_results(mut results: Vec<ck_core::SearchResult>) -> Vec<ck_core:
     results
 }
 
+/// Validate and canonicalize a path to prevent path traversal attacks
+///
+/// This function ensures that:
+/// 1. The path exists and can be canonicalized (resolves symlinks and .. components)
+/// 2. The canonicalized path is within the allowed root directory
+///
+/// # Security
+/// This prevents path traversal attacks where malicious clients could access files
+/// outside the intended working directory (e.g., /etc/passwd, ../../../../secrets)
+fn validate_and_canonicalize_path(path: &Path, allowed_root: &Path) -> Result<PathBuf, ErrorData> {
+    // Canonicalize the input path (resolves symlinks, .., ., etc.)
+    let canonical = path.canonicalize()
+        .map_err(|e| ErrorData::invalid_params(
+            format!("Invalid path '{}': {}", path.display(), e),
+            None
+        ))?;
+
+    // Canonicalize the allowed root directory
+    let canonical_root = allowed_root.canonicalize()
+        .map_err(|e| ErrorData::internal_error(
+            format!("Failed to canonicalize working directory '{}': {}", allowed_root.display(), e),
+            None
+        ))?;
+
+    // Ensure the canonical path is within the allowed root
+    if !canonical.starts_with(&canonical_root) {
+        return Err(ErrorData::invalid_params(
+            format!(
+                "Access denied: path '{}' is outside allowed directory '{}'",
+                path.display(),
+                allowed_root.display()
+            ),
+            None
+        ));
+    }
+
+    Ok(canonical)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,6 +112,95 @@ mod tests {
         assert!(saw_docs, "docs directory should be included");
         assert!(saw_rs, "lib.rs should be included via glob");
         assert!(saw_ts, "file.ts should be included explicitly");
+    }
+
+    #[test]
+    fn test_validate_path_within_allowed_root() {
+        let temp_dir = tempdir().unwrap();
+        let root = temp_dir.path();
+
+        // Create a subdirectory
+        let sub_dir = root.join("subdir");
+        fs::create_dir_all(&sub_dir).unwrap();
+
+        // Valid path within root should succeed
+        let result = validate_and_canonicalize_path(&sub_dir, root);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), sub_dir.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn test_validate_path_traversal_blocked() {
+        let temp_dir = tempdir().unwrap();
+        let root = temp_dir.path();
+
+        // Create subdirectory
+        fs::create_dir_all(root.join("subdir")).unwrap();
+
+        // Attempt path traversal - should fail
+        let parent = root.parent().unwrap();
+        let result = validate_and_canonicalize_path(parent, root);
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode(-32602)); // Invalid params error code
+        assert!(err.message.contains("Access denied"));
+    }
+
+    #[test]
+    fn test_validate_path_with_dotdot() {
+        let temp_dir = tempdir().unwrap();
+        let root = temp_dir.path();
+
+        // Create nested directories
+        fs::create_dir_all(root.join("a/b")).unwrap();
+
+        // Path with .. that stays within root should succeed
+        let path_with_dotdot = root.join("a/b/../b");
+        let result = validate_and_canonicalize_path(&path_with_dotdot, root);
+        assert!(result.is_ok());
+
+        // Path with .. that escapes root should fail
+        let escape_path = root.join("a/../../..");
+        let result = validate_and_canonicalize_path(&escape_path, root);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_path_nonexistent() {
+        let temp_dir = tempdir().unwrap();
+        let root = temp_dir.path();
+
+        // Non-existent path should fail
+        let nonexistent = root.join("does_not_exist");
+        let result = validate_and_canonicalize_path(&nonexistent, root);
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode(-32602)); // Invalid params error code
+        assert!(err.message.contains("Invalid path"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_validate_path_symlink_escape_blocked() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempdir().unwrap();
+        let root = temp_dir.path();
+
+        // Create a symlink pointing outside the root
+        let symlink_path = root.join("escape_link");
+        let target = root.parent().unwrap();
+
+        symlink(target, &symlink_path).unwrap();
+
+        // Following the symlink should be blocked
+        let result = validate_and_canonicalize_path(&symlink_path, root);
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        assert!(err.message.contains("Access denied"));
     }
 }
 
@@ -988,6 +1116,10 @@ impl CkMcpServer {
         let top_k = request.top_k;
         let threshold = request.threshold;
         let path_buf = PathBuf::from(path);
+
+        // Validate and canonicalize path to prevent path traversal attacks
+        let path_buf = validate_and_canonicalize_path(&path_buf, &self.context.cwd)?;
+
         let search_root = if path_buf.is_dir() {
             path_buf.clone()
         } else {
@@ -1010,14 +1142,6 @@ impl CkMcpServer {
         // Clone values before they're moved into SearchOptions
         let query_clone = query.clone();
         let path_clone = path_buf.clone();
-
-        // Validate path exists
-        if !path_buf.exists() {
-            return Err(ErrorData::invalid_params(
-                format!("Path does not exist: {}", path_buf.display()),
-                None,
-            ));
-        }
 
         // Extract pagination config
         let config = Self::extract_pagination_config(
@@ -1227,6 +1351,10 @@ impl CkMcpServer {
         let top_k = request.top_k;
         let threshold = request.threshold;
         let path_buf = PathBuf::from(path);
+
+        // Validate and canonicalize path to prevent path traversal attacks
+        let path_buf = validate_and_canonicalize_path(&path_buf, &self.context.cwd)?;
+
         let search_root = if path_buf.is_dir() {
             path_buf.clone()
         } else {
@@ -1248,13 +1376,6 @@ impl CkMcpServer {
 
         let query_clone = query.clone();
         let path_clone = path_buf.clone();
-
-        if !path_buf.exists() {
-            return Err(ErrorData::invalid_params(
-                format!("Path does not exist: {}", path_buf.display()),
-                None,
-            ));
-        }
 
         let config = Self::extract_pagination_config(
             request.page_size,
@@ -1360,6 +1481,10 @@ impl CkMcpServer {
         let ignore_case = request.ignore_case;
         let context = request.context;
         let path_buf = PathBuf::from(path);
+
+        // Validate and canonicalize path to prevent path traversal attacks
+        let path_buf = validate_and_canonicalize_path(&path_buf, &self.context.cwd)?;
+
         let search_root = if path_buf.is_dir() {
             path_buf.clone()
         } else {
@@ -1382,14 +1507,6 @@ impl CkMcpServer {
         // Clone values before they're moved into SearchOptions
         let pattern_clone = pattern.clone();
         let path_clone = path_buf.clone();
-
-        // Validate path exists
-        if !path_buf.exists() {
-            return Err(ErrorData::invalid_params(
-                format!("Path does not exist: {}", path_buf.display()),
-                None,
-            ));
-        }
 
         let context_lines = context.unwrap_or(0);
 
@@ -1494,6 +1611,10 @@ impl CkMcpServer {
         let top_k = request.top_k;
         let threshold = request.threshold;
         let path_buf = PathBuf::from(path);
+
+        // Validate and canonicalize path to prevent path traversal attacks
+        let path_buf = validate_and_canonicalize_path(&path_buf, &self.context.cwd)?;
+
         let search_root = if path_buf.is_dir() {
             path_buf.clone()
         } else {
@@ -1516,14 +1637,6 @@ impl CkMcpServer {
         // Clone values before they're moved into SearchOptions
         let query_clone = query.clone();
         let path_clone = path_buf.clone();
-
-        // Validate path exists
-        if !path_buf.exists() {
-            return Err(ErrorData::invalid_params(
-                format!("Path does not exist: {}", path_buf.display()),
-                None,
-            ));
-        }
 
         // Extract pagination config
         let config = Self::extract_pagination_config(
@@ -1627,13 +1740,8 @@ impl CkMcpServer {
         let path = request.path;
         let path_buf = PathBuf::from(path);
 
-        // Validate path exists
-        if !path_buf.exists() {
-            return Err(ErrorData::invalid_params(
-                format!("Path does not exist: {}", path_buf.display()),
-                None,
-            ));
-        }
+        // Validate and canonicalize path to prevent path traversal attacks
+        let path_buf = validate_and_canonicalize_path(&path_buf, &self.context.cwd)?;
 
         // Use concurrency lock for this directory
         let lock = self.context.get_index_lock(&path_buf).await;
@@ -1751,13 +1859,8 @@ impl CkMcpServer {
         let force = request.force.unwrap_or(false);
         let path_buf = PathBuf::from(path);
 
-        // Validate path exists
-        if !path_buf.exists() {
-            return Err(ErrorData::invalid_params(
-                format!("Path does not exist: {}", path_buf.display()),
-                None,
-            ));
-        }
+        // Validate and canonicalize path to prevent path traversal attacks
+        let path_buf = validate_and_canonicalize_path(&path_buf, &self.context.cwd)?;
 
         // Use concurrency lock for this directory
         let lock = self.context.get_index_lock(&path_buf).await;
