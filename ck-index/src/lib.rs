@@ -1151,6 +1151,16 @@ pub async fn smart_update_index_with_detailed_progress(
         save_manifest(&manifest_path, &manifest)?;
     }
 
+    // Build/update trigram index for regex search acceleration
+    let should_update_trigrams =
+        stats.files_indexed > 0 || stats.files_modified > 0 || stats.files_added > 0;
+    if should_update_trigrams
+        && let Err(e) = build_trigram_index(&repo_root, &manifest, &files_to_update, &[])
+    {
+        tracing::warn!("Failed to build trigram index: {}", e);
+        // Don't fail the whole indexing operation for trigram index errors
+    }
+
     Ok(stats)
 }
 
@@ -2414,6 +2424,117 @@ mod cleanup_validation {
 
         Ok(())
     }
+}
+
+// ============================================================================
+// Trigram Index Building
+// ============================================================================
+
+/// Path to the trigram index file within the .ck directory
+pub fn get_trigram_index_path(index_dir: &Path) -> PathBuf {
+    index_dir.join("trigrams.bin")
+}
+
+/// Build or update the trigram index for all text files in the manifest.
+/// This is called after the main indexing process completes.
+pub fn build_trigram_index(
+    repo_root: &Path,
+    manifest: &IndexManifest,
+    files_updated: &[PathBuf],
+    files_removed: &[PathBuf],
+) -> Result<()> {
+    let index_dir = repo_root.join(".ck");
+    let trigram_path = get_trigram_index_path(&index_dir);
+
+    // Load existing index or create new one
+    let mut trigram_index = ck_trigram::TrigramIndex::load_or_new(&trigram_path, false);
+
+    // Remove deleted files from the trigram index
+    for file_path in files_removed {
+        let standard_path = if file_path.is_absolute() {
+            file_path
+                .strip_prefix(repo_root)
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|_| file_path.clone())
+        } else {
+            file_path.clone()
+        };
+        trigram_index.remove_file(&standard_path);
+    }
+
+    // Update trigram index for modified/added files
+    for file_path in files_updated {
+        let absolute_path = if file_path.is_absolute() {
+            file_path.clone()
+        } else {
+            repo_root.join(file_path)
+        };
+
+        let standard_path = file_path
+            .strip_prefix(repo_root)
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|_| file_path.clone());
+
+        // Read file content and add to trigram index
+        match std::fs::read(&absolute_path) {
+            Ok(content) => {
+                // Only index text files (skip binary)
+                if is_likely_text(&content) {
+                    trigram_index.add_file(&standard_path, &content);
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "Could not read file for trigram indexing {:?}: {}",
+                    file_path,
+                    e
+                );
+            }
+        }
+    }
+
+    // If this is a fresh index with no updates, build from all manifest files
+    if files_updated.is_empty() && files_removed.is_empty() && trigram_index.file_count() == 0 {
+        tracing::info!(
+            "Building trigram index from {} manifest files",
+            manifest.files.len()
+        );
+        for manifest_path in manifest.files.keys() {
+            let standard_path = path_utils::from_manifest_path(manifest_path);
+            let absolute_path = repo_root.join(&standard_path);
+
+            match std::fs::read(&absolute_path) {
+                Ok(content) => {
+                    if is_likely_text(&content) {
+                        trigram_index.add_file(&standard_path, &content);
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "Could not read file for trigram indexing {:?}: {}",
+                        absolute_path,
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    // Save the trigram index
+    if trigram_index.file_count() > 0 {
+        trigram_index.save(&trigram_path)?;
+        let stats = trigram_index.stats();
+        tracing::info!("Trigram index: {}", stats);
+    }
+
+    Ok(())
+}
+
+/// Check if content is likely text (not binary).
+/// Uses a simple heuristic: check for null bytes in the first 8KB.
+fn is_likely_text(content: &[u8]) -> bool {
+    let check_len = content.len().min(8192);
+    !content[..check_len].contains(&0)
 }
 
 // ============================================================================

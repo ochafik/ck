@@ -17,6 +17,7 @@ ck-index = { workspace = true }
 ck-embed = { workspace = true }
 ck-chunk = { workspace = true }
 ck-models = { workspace = true }
+ck-trigram = { workspace = true }
 serde_json = { workspace = true }
 
 anyhow = { workspace = true }

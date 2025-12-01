@@ -20,6 +20,96 @@ pub type SearchProgressCallback = Box<dyn Fn(&str) + Send + Sync>;
 pub type IndexingProgressCallback = Box<dyn Fn(&str) + Send + Sync>;
 pub type DetailedIndexingProgressCallback = Box<dyn Fn(ck_index::EmbeddingProgress) + Send + Sync>;
 
+/// Filter files using the trigram index for faster regex search.
+/// Returns the original list if no trigram index or no extractable literals.
+fn filter_files_with_trigram_index(
+    search_path: &Path,
+    all_files: &[PathBuf],
+    pattern: &str,
+    case_insensitive: bool,
+) -> Vec<PathBuf> {
+    // Find the index root
+    let index_root = find_nearest_index_root(search_path).unwrap_or_else(|| {
+        if search_path.is_file() {
+            search_path.parent().unwrap_or(search_path).to_path_buf()
+        } else {
+            search_path.to_path_buf()
+        }
+    });
+
+    let trigram_path = ck_index::get_trigram_index_path(&index_root.join(".ck"));
+
+    // Try to load the trigram index
+    let trigram_index = match ck_trigram::TrigramIndex::load(&trigram_path) {
+        Ok(index) => index,
+        Err(_) => {
+            tracing::debug!("No trigram index found, using full file scan");
+            return all_files.to_vec();
+        }
+    };
+
+    // Extract trigrams from the pattern
+    let trigrams = if case_insensitive {
+        ck_trigram::extract_pattern_trigrams_lowercase(pattern)
+    } else {
+        ck_trigram::extract_pattern_trigrams(pattern)
+    };
+
+    let trigrams = match trigrams {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            tracing::debug!(
+                "No extractable trigrams from pattern '{}', using full file scan",
+                pattern
+            );
+            return all_files.to_vec();
+        }
+    };
+
+    // Query the trigram index
+    let candidate_paths: std::collections::HashSet<PathBuf> = trigram_index
+        .query(&trigrams)
+        .into_iter()
+        .map(|p| p.to_path_buf())
+        .collect();
+
+    // Filter the file list to only include candidates
+    // We need to match relative paths since trigram index stores relative paths
+    let filtered: Vec<PathBuf> = all_files
+        .iter()
+        .filter(|file_path| {
+            let relative_path = file_path
+                .strip_prefix(&index_root)
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|_| (*file_path).clone());
+            candidate_paths.contains(&relative_path)
+        })
+        .cloned()
+        .collect();
+
+    let total = all_files.len();
+    let filtered_count = filtered.len();
+
+    // Only use trigram filtering if it significantly reduces the search space
+    // If more than 50% of files match, it's faster to just scan everything
+    if filtered_count > 0 && filtered_count < total / 2 {
+        tracing::info!(
+            "Trigram filter: {} -> {} files ({:.1}% reduction)",
+            total,
+            filtered_count,
+            (1.0 - filtered_count as f64 / total as f64) * 100.0
+        );
+        filtered
+    } else {
+        tracing::debug!(
+            "Trigram filter not effective ({}/{} files), using full scan",
+            filtered_count,
+            total
+        );
+        all_files.to_vec()
+    }
+}
+
 /// Resolve the actual file path to read content from
 /// For PDFs: returns cache path and validates it exists
 /// For regular files: returns original path
@@ -459,7 +549,7 @@ fn regex_search(options: &SearchOptions) -> Result<Vec<SearchResult>> {
 
     // Default to recursive for directories (like grep) to maintain compatibility
     let should_recurse = options.path.is_dir() || options.recursive;
-    let files = if should_recurse {
+    let all_files = if should_recurse {
         // Use ck_index's collect_files which respects gitignore
         let file_options = ck_core::FileCollectionOptions {
             respect_gitignore: options.respect_gitignore,
@@ -474,6 +564,14 @@ fn regex_search(options: &SearchOptions) -> Result<Vec<SearchResult>> {
         let collected = collect_files(&options.path, should_recurse, &options.exclude_patterns)?;
         filter_files_by_include(collected, &options.include_patterns)
     };
+
+    // Try to use trigram index to filter files (if available)
+    let files = filter_files_with_trigram_index(
+        &options.path,
+        &all_files,
+        &options.query,
+        options.case_insensitive,
+    );
 
     let results: Vec<Vec<SearchResult>> = files
         .par_iter()

@@ -15,6 +15,7 @@ ck-core = { workspace = true }
 ck-chunk = { workspace = true }
 ck-embed = { workspace = true }
 ck-models = { workspace = true }
+ck-trigram = { workspace = true }
 
 anyhow = { workspace = true }
 serde = { workspace = true }
