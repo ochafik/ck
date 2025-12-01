@@ -16,9 +16,19 @@ ck-core = { version = "0.7.1", path = "../ck-core" }
 anyhow = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 
 fastembed = { workspace = true, optional = true }
 
+# Static embeddings support
+tokenizers = { workspace = true }
+safetensors = { workspace = true }
+bytemuck = { workspace = true }
+reqwest = { workspace = true }
+futures-util = { workspace = true }
+indicatif = { workspace = true }
+
 [features]
-default = ["fastembed"]
+default = ["fastembed", "static-embeddings"]
 fastembed = ["dep:fastembed"]
+static-embeddings = []

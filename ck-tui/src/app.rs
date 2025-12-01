@@ -40,6 +40,33 @@ pub struct TuiApp {
     active_search: Option<JoinHandle<()>>,
 }
 
+/// Resolve the default threshold for semantic search based on the model from the index.
+fn resolve_model_threshold(search_path: &Path) -> f32 {
+    let registry = ck_models::ModelRegistry::default();
+
+    // Try to get model from index manifest
+    let manifest_path = search_path.join(".ck").join("manifest.json");
+    if let Ok(data) = std::fs::read(&manifest_path)
+        && let Ok(manifest) = serde_json::from_slice::<ck_index::IndexManifest>(&data)
+        && let Some(ref model_name) = manifest.embedding_model
+    {
+        // Try to find this model in the registry by alias
+        if let Some(config) = registry.get_model(model_name) {
+            return config.default_threshold;
+        }
+        // Try by full name
+        if let Some((_, config)) = registry.models.iter().find(|(_, c)| c.name == *model_name) {
+            return config.default_threshold;
+        }
+    }
+
+    // Fall back to registry default model's threshold
+    registry
+        .get_default_model()
+        .map(|c| c.default_threshold)
+        .unwrap_or(0.6)
+}
+
 impl TuiApp {
     pub fn new(search_path: PathBuf, initial_query: Option<String>) -> Self {
         let query = initial_query.unwrap_or_default();
@@ -536,8 +563,9 @@ impl TuiApp {
 
         terminal.draw(|f| self.draw(f))?;
 
+        // Use model-specific threshold for semantic search
         let threshold = match self.state.mode {
-            SearchMode::Semantic => Some(0.6),
+            SearchMode::Semantic => Some(resolve_model_threshold(&self.state.search_path)),
             SearchMode::Hybrid => None,
             SearchMode::Regex => None,
             SearchMode::Lexical => None,

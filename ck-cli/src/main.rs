@@ -328,9 +328,29 @@ struct Cli {
     #[arg(
         long = "model",
         value_name = "MODEL",
-        help = "Embedding model to use for indexing (bge-small, nomic-v1.5, jina-code) [default: bge-small]. Only used with --index."
+        help = "Embedding model to use for indexing (bge-small, nomic-v1.5, jina-code, static-retrieval-en, static-multilingual) [default: bge-small]. Only used with --index."
     )]
     model: Option<String>,
+
+    #[arg(
+        long = "truncate-dim",
+        value_name = "DIM",
+        help = "Truncate embedding dimensions for static models (MRL). Valid: 32, 64, 128, 256, 512, 1024. Reduces memory/index size with minimal quality loss."
+    )]
+    truncate_dim: Option<usize>,
+
+    #[arg(
+        long = "list-models",
+        help = "List available embedding models and exit"
+    )]
+    list_models: bool,
+
+    #[arg(
+        long = "download-model",
+        value_name = "MODEL",
+        help = "Download a model without indexing (useful for pre-caching)"
+    )]
+    download_model: Option<String>,
 
     // Search-time enhancement options
     #[arg(
@@ -449,6 +469,44 @@ fn build_exclude_patterns(cli: &Cli) -> Vec<String> {
     // Use the centralized pattern builder from ck-core
     // Note: .ckignore handling is now done by WalkBuilder via the use_ckignore parameter
     ck_core::build_exclude_patterns(&cli.exclude, !cli.no_default_excludes)
+}
+
+/// Resolve the default threshold for semantic search based on the model being used.
+/// Reads from the index manifest if available, otherwise uses the CLI model or registry default.
+fn resolve_model_threshold(repo_root: Option<&Path>, cli_model: Option<&str>) -> f32 {
+    let registry = ck_models::ModelRegistry::default();
+
+    // Try to get model from index manifest first (if we have a repo root)
+    if let Some(root) = repo_root
+        && let Ok(data) = std::fs::read(root.join(".ck").join("manifest.json"))
+        && let Ok(manifest) = serde_json::from_slice::<ck_index::IndexManifest>(&data)
+        && let Some(ref model_name) = manifest.embedding_model
+    {
+        // Try to find this model in the registry
+        if let Some(config) = registry.get_model(model_name) {
+            return config.default_threshold;
+        }
+        // Try by full name
+        if let Some((_, config)) = registry.models.iter().find(|(_, c)| c.name == *model_name) {
+            return config.default_threshold;
+        }
+    }
+
+    // Fall back to CLI model argument
+    if let Some(model_name) = cli_model {
+        if let Some(config) = registry.get_model(model_name) {
+            return config.default_threshold;
+        }
+        if let Some((_, config)) = registry.models.iter().find(|(_, c)| c.name == model_name) {
+            return config.default_threshold;
+        }
+    }
+
+    // Fall back to registry default model's threshold
+    registry
+        .get_default_model()
+        .map(|c| c.default_threshold)
+        .unwrap_or(0.6)
 }
 
 fn resolve_model_selection(
@@ -974,6 +1032,18 @@ async fn run_cli_mode(cli: Cli) -> Result<()> {
 
     let status = StatusReporter::new(cli.quiet);
 
+    // Handle --list-models flag
+    if cli.list_models {
+        list_available_models();
+        return Ok(());
+    }
+
+    // Handle --download-model flag
+    if let Some(ref model_name) = cli.download_model {
+        download_model_command(model_name, &status).await?;
+        return Ok(());
+    }
+
     // Handle command flags first (these take precedence over search)
     if let Some(model_name) = cli.switch_model.as_deref() {
         let path = cli
@@ -1411,7 +1481,7 @@ async fn run_cli_mode(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-fn build_options(cli: &Cli, reindex: bool, _repo_root: Option<&Path>) -> SearchOptions {
+fn build_options(cli: &Cli, reindex: bool, repo_root: Option<&Path>) -> SearchOptions {
     let mode = if cli.semantic {
         SearchMode::Semantic
     } else if cli.lexical {
@@ -1434,8 +1504,9 @@ fn build_options(cli: &Cli, reindex: bool, _repo_root: Option<&Path>) -> SearchO
         SearchMode::Semantic => Some(10),
         _ => None,
     };
+    // Use model-specific threshold for semantic search
     let default_threshold = match mode {
-        SearchMode::Semantic => Some(0.6),
+        SearchMode::Semantic => Some(resolve_model_threshold(repo_root, cli.model.as_deref())),
         _ => None,
     };
 
@@ -1553,6 +1624,146 @@ fn apply_heatmap_color(token: &str, score: f32) -> String {
         }
         None => token.to_string(),
     }
+}
+
+/// List all available embedding models
+fn list_available_models() {
+    use console::style;
+
+    let registry = ck_models::ModelRegistry::default();
+
+    println!(
+        "{}",
+        style("Available Embedding Models").bold().underlined()
+    );
+    println!();
+
+    // Separate models by provider
+    let mut fastembed_models: Vec<_> = registry
+        .models
+        .iter()
+        .filter(|(_, c)| c.provider == "fastembed")
+        .collect();
+    let mut static_models: Vec<_> = registry
+        .models
+        .iter()
+        .filter(|(_, c)| c.provider == "static")
+        .collect();
+
+    fastembed_models.sort_by_key(|(alias, _)| alias.as_str());
+    static_models.sort_by_key(|(alias, _)| alias.as_str());
+
+    // Print transformer models
+    println!(
+        "{}",
+        style("Transformer Models (via fastembed):").cyan().bold()
+    );
+    for (alias, config) in &fastembed_models {
+        let default_marker = if *alias == &registry.default_model {
+            " [default]"
+        } else {
+            ""
+        };
+        println!(
+            "  {} - {}d, {}{}",
+            style(alias).green(),
+            config.dimensions,
+            config.description,
+            style(default_marker).yellow()
+        );
+    }
+
+    println!();
+
+    // Print static models
+    println!(
+        "{}",
+        style("Static Embedding Models (100-400x faster):")
+            .cyan()
+            .bold()
+    );
+    for (alias, config) in &static_models {
+        let mrl_info = config
+            .mrl_dims
+            .as_ref()
+            .map(|dims| {
+                format!(
+                    " (MRL: {})",
+                    dims.iter()
+                        .map(|d| d.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+            .unwrap_or_default();
+        println!(
+            "  {} - {}d{}, {}",
+            style(alias).green(),
+            config.dimensions,
+            style(mrl_info).dim(),
+            config.description
+        );
+    }
+
+    println!();
+    println!("{}", style("Usage Examples:").bold());
+    println!("  ck --index --model static-retrieval-en .     # Use static model (fast)");
+    println!("  ck --index --model static-retrieval-en --truncate-dim 256 .  # With MRL");
+    println!("  ck --download-model static-retrieval-en      # Pre-download model");
+}
+
+/// Download a model without indexing
+async fn download_model_command(model_name: &str, status: &StatusReporter) -> Result<()> {
+    use ck_embed::{is_static_model, resolve_model_name};
+
+    status.section_header("Downloading Model");
+
+    let registry = ck_models::ModelRegistry::default();
+    let (alias, config) = resolve_model_selection(&registry, Some(model_name))?;
+
+    if config.provider == "static" || is_static_model(&config.name) {
+        let repo_id = resolve_model_name(&config.name);
+        status.info(&format!("Model: {} (alias '{}')", repo_id, alias));
+        status.info(&format!("Dimensions: {}", config.dimensions));
+
+        if let Some(ref mrl_dims) = config.mrl_dims {
+            status.info(&format!(
+                "MRL dimensions: {}",
+                mrl_dims
+                    .iter()
+                    .map(|d| d.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+
+        let spinner = status.create_spinner("Downloading...");
+
+        // Download the model
+        let model_path = ck_embed::download_static_model(repo_id, true).await?;
+
+        status.finish_progress(spinner, "Download complete");
+        status.success(&format!("Model cached at: {}", model_path.display()));
+    } else {
+        // For fastembed models, create an embedder to trigger download
+        status.info(&format!("Model: {} (alias '{}')", config.name, alias));
+        status.info(&format!("Provider: {}", config.provider));
+
+        let spinner = status.create_spinner("Downloading...");
+
+        let progress_callback: ck_embed::ModelDownloadCallback = Box::new(|msg: &str| {
+            eprintln!("  {}", msg);
+        });
+
+        // Creating the embedder will download the model
+        let _embedder =
+            ck_embed::create_embedder_with_progress(Some(&config.name), Some(progress_callback))?;
+
+        status.finish_progress(spinner, "Download complete");
+        status.success("Model ready for use");
+    }
+
+    Ok(())
 }
 
 struct SearchSummary {

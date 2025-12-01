@@ -57,3 +57,11 @@ pdf-extract = "0.9"
 uuid = { version = "1.8", features = ["v4", "serde"] }
 base64 = "0.22"
 sha2 = "0.10"
+
+# Static embeddings support
+tokenizers = "0.21"
+safetensors = "0.5"
+bytemuck = { version = "1.14", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+futures-util = "0.3"
+indicatif = "0.17"

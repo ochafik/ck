@@ -3,10 +3,20 @@ use anyhow::Result;
 #[cfg(feature = "fastembed")]
 use std::path::{Path, PathBuf};
 
+pub mod model_downloader;
 pub mod reranker;
+pub mod static_embedder;
 pub mod tokenizer;
 
+pub use model_downloader::{
+    download_static_model, ensure_model_downloaded, get_model_cache_dir, get_model_path,
+    is_model_downloaded,
+};
 pub use reranker::{RerankResult, Reranker, create_reranker, create_reranker_with_progress};
+pub use static_embedder::{
+    MRL_DIMENSIONS, STATIC_RETRIEVAL_EN, STATIC_SIMILARITY_MULTILINGUAL, StaticEmbedder,
+    is_static_model, resolve_model_name,
+};
 pub use tokenizer::TokenEstimator;
 
 pub trait Embedder: Send + Sync {
@@ -18,6 +28,15 @@ pub trait Embedder: Send + Sync {
 
 pub type ModelDownloadCallback = Box<dyn Fn(&str) + Send + Sync>;
 
+/// Options for creating an embedder
+#[derive(Default, Clone)]
+pub struct EmbedderOptions {
+    /// Model name or alias
+    pub model_name: Option<String>,
+    /// MRL dimension truncation (for static models)
+    pub truncate_dim: Option<usize>,
+}
+
 pub fn create_embedder(model_name: Option<&str>) -> Result<Box<dyn Embedder>> {
     create_embedder_with_progress(model_name, None)
 }
@@ -26,8 +45,36 @@ pub fn create_embedder_with_progress(
     model_name: Option<&str>,
     progress_callback: Option<ModelDownloadCallback>,
 ) -> Result<Box<dyn Embedder>> {
-    let model = model_name.unwrap_or("BAAI/bge-small-en-v1.5");
+    create_embedder_with_options(
+        &EmbedderOptions {
+            model_name: model_name.map(String::from),
+            truncate_dim: None,
+        },
+        progress_callback,
+    )
+}
 
+/// Create an embedder with full options support
+pub fn create_embedder_with_options(
+    options: &EmbedderOptions,
+    progress_callback: Option<ModelDownloadCallback>,
+) -> Result<Box<dyn Embedder>> {
+    let model = options
+        .model_name
+        .as_deref()
+        .unwrap_or("BAAI/bge-small-en-v1.5");
+
+    // Check if this is a static embedding model
+    if is_static_model(model) {
+        let repo_id = resolve_model_name(model);
+        return Ok(Box::new(StaticEmbedder::from_huggingface(
+            repo_id,
+            options.truncate_dim,
+            progress_callback,
+        )?));
+    }
+
+    // Fall back to fastembed for transformer models
     #[cfg(feature = "fastembed")]
     {
         Ok(Box::new(FastEmbedder::new_with_progress(
