@@ -191,7 +191,8 @@ pub fn collect_files(
             .git_ignore(true)
             .git_global(true)
             .git_exclude(true)
-            .hidden(true);
+            .hidden(true)
+            .follow_links(true);
 
         // Add .ckignore support (hierarchical, like .gitignore)
         if options.use_ckignore {
@@ -213,7 +214,7 @@ pub fn collect_files(
         let combined_overrides = build_overrides(path, &all_patterns)?;
 
         let mut walker_builder = WalkBuilder::new(path);
-        walker_builder.git_ignore(false).hidden(true);
+        walker_builder.git_ignore(false).hidden(true).follow_links(true);
 
         // Add .ckignore support even without gitignore
         if options.use_ckignore {
@@ -1521,8 +1522,18 @@ fn should_reextract(source_path: &Path, cache_path: &Path) -> Result<bool> {
 
 /// Extract text content from a PDF file
 fn extract_pdf_text(path: &Path) -> Result<String> {
-    pdf_extract::extract_text(path)
-        .map_err(|e| anyhow::anyhow!("Failed to extract text from PDF {}: {}", path.display(), e))
+    // Spawn PDF extraction in a thread with larger stack to avoid stack overflow
+    // on complex PDFs with deeply nested structures
+    let path = path.to_path_buf();
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024) // 8MB stack
+        .spawn(move || {
+            pdf_extract::extract_text(&path)
+                .map_err(|e| anyhow::anyhow!("Failed to extract text from PDF {}: {}", path.display(), e))
+        })
+        .map_err(|e| anyhow::anyhow!("Failed to spawn PDF extraction thread: {}", e))?
+        .join()
+        .map_err(|_| anyhow::anyhow!("PDF extraction thread panicked"))?
 }
 
 /// Preprocess a file if needed, returning path to readable content
