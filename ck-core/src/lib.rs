@@ -309,6 +309,9 @@ pub struct FileCollectionOptions {
     pub exclude_patterns: Vec<String>,
     /// Whether to include hidden (dot-prefixed) files and directories
     pub show_hidden: bool,
+    /// Glob patterns to include files (like ripgrep's -g flag)
+    /// When non-empty, only files matching at least one pattern are included
+    pub glob_patterns: Vec<String>,
 }
 
 impl Default for FileCollectionOptions {
@@ -318,6 +321,7 @@ impl Default for FileCollectionOptions {
             use_ckignore: true,
             exclude_patterns: Vec::new(),
             show_hidden: false,
+            glob_patterns: Vec::new(),
         }
     }
 }
@@ -329,6 +333,7 @@ impl From<&SearchOptions> for FileCollectionOptions {
             use_ckignore: true, // Always use .ckignore for hierarchical ignore support
             exclude_patterns: opts.exclude_patterns.clone(),
             show_hidden: opts.hidden,
+            glob_patterns: opts.glob_patterns.clone(),
         }
     }
 }
@@ -358,6 +363,7 @@ pub struct SearchOptions {
     pub files_without_matches: bool,
     pub exclude_patterns: Vec<String>,
     pub include_patterns: Vec<IncludePattern>,
+    pub glob_patterns: Vec<String>,
     pub respect_gitignore: bool,
     pub use_ckignore: bool,
     pub full_section: bool,
@@ -417,6 +423,7 @@ impl Default for SearchOptions {
             files_without_matches: false,
             exclude_patterns: get_default_exclude_patterns(),
             include_patterns: Vec::new(),
+            glob_patterns: Vec::new(),
             respect_gitignore: true,
             use_ckignore: true,
             full_section: false,

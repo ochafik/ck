@@ -1461,10 +1461,22 @@ fn test_trigram_index_accelerates_regex_search() {
     let stdout = String::from_utf8(output.stdout).unwrap();
 
     // Should find matches in files 0, 5, 10, 15
-    assert!(stdout.contains("file0.txt"), "Should find match in file0.txt");
-    assert!(stdout.contains("file5.txt"), "Should find match in file5.txt");
-    assert!(stdout.contains("file10.txt"), "Should find match in file10.txt");
-    assert!(stdout.contains("file15.txt"), "Should find match in file15.txt");
+    assert!(
+        stdout.contains("file0.txt"),
+        "Should find match in file0.txt"
+    );
+    assert!(
+        stdout.contains("file5.txt"),
+        "Should find match in file5.txt"
+    );
+    assert!(
+        stdout.contains("file10.txt"),
+        "Should find match in file10.txt"
+    );
+    assert!(
+        stdout.contains("file15.txt"),
+        "Should find match in file15.txt"
+    );
 
     // Should NOT find matches in other files
     assert!(!stdout.contains("file1.txt"), "Should not match file1.txt");

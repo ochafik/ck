@@ -89,13 +89,26 @@ pub fn request_interrupt() {
     INTERRUPTED.store(true, Ordering::SeqCst);
 }
 
-/// Build override patterns for excluding files during directory traversal
+/// Build override patterns for including/excluding files during directory traversal
+///
+/// # Arguments
+/// * `base_path` - The base path for resolving relative patterns
+/// * `exclude_patterns` - Patterns to exclude (will be prefixed with `!`)
+/// * `glob_patterns` - Patterns to include (files must match at least one if non-empty)
 fn build_overrides(
     base_path: &Path,
     exclude_patterns: &[String],
+    glob_patterns: &[String],
 ) -> Result<ignore::overrides::Override> {
     let mut builder = OverrideBuilder::new(base_path);
 
+    // Add include patterns first (without ! prefix)
+    // When glob_patterns is non-empty, only files matching at least one pattern are included
+    for pattern in glob_patterns {
+        builder.add(pattern)?;
+    }
+
+    // Add exclude patterns (with ! prefix to exclude)
     for pattern in exclude_patterns {
         if pattern.starts_with('!') {
             builder.add(pattern)?;
@@ -195,7 +208,7 @@ pub fn collect_files(
     let index_dir = ck_core::index_dir(path);
 
     if options.respect_gitignore {
-        let overrides = build_overrides(path, &options.exclude_patterns)?;
+        let overrides = build_overrides(path, &options.exclude_patterns, &options.glob_patterns)?;
         let mut walker_builder = WalkBuilder::new(path);
         walker_builder
             .git_ignore(true)
@@ -221,7 +234,7 @@ pub fn collect_files(
         // Combine default patterns with user exclude patterns
         let mut all_patterns = default_patterns;
         all_patterns.extend(options.exclude_patterns.iter().cloned());
-        let combined_overrides = build_overrides(path, &all_patterns)?;
+        let combined_overrides = build_overrides(path, &all_patterns, &options.glob_patterns)?;
 
         let mut walker_builder = WalkBuilder::new(path);
         walker_builder
@@ -1642,8 +1655,9 @@ fn extract_pdf_text(path: &Path) -> Result<String> {
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024) // 8MB stack
         .spawn(move || {
-            pdf_extract::extract_text(&path)
-                .map_err(|e| anyhow::anyhow!("Failed to extract text from PDF {}: {}", path.display(), e))
+            pdf_extract::extract_text(&path).map_err(|e| {
+                anyhow::anyhow!("Failed to extract text from PDF {}: {}", path.display(), e)
+            })
         })
         .map_err(|e| anyhow::anyhow!("Failed to spawn PDF extraction thread: {}", e))?
         .join()
@@ -1957,6 +1971,7 @@ mod tests {
             use_ckignore: true,
             exclude_patterns: vec![],
             show_hidden: false,
+            glob_patterns: vec![],
         };
 
         // First index
@@ -2022,6 +2037,7 @@ mod tests {
             use_ckignore: true,
             exclude_patterns: vec![],
             show_hidden: false,
+            glob_patterns: vec![],
         };
         let stats = cleanup_index(test_path, &file_options).unwrap();
         assert_eq!(stats.orphaned_entries_removed, 1);
@@ -2218,6 +2234,7 @@ mod tests {
             use_ckignore: false,
             exclude_patterns: vec![],
             show_hidden: false,
+            glob_patterns: vec![],
         };
         let files = collect_files(test_path, &options_respect).unwrap();
         assert_eq!(
@@ -2232,6 +2249,7 @@ mod tests {
             use_ckignore: false,
             exclude_patterns: vec![],
             show_hidden: false,
+            glob_patterns: vec![],
         };
         let files = collect_files(test_path, &options_no_ignore).unwrap();
         assert_eq!(
@@ -2262,6 +2280,7 @@ mod tests {
             use_ckignore: true,
             exclude_patterns: vec![],
             show_hidden: false,
+            glob_patterns: vec![],
         };
 
         let files = collect_files(test_path, &options).unwrap();
@@ -2295,6 +2314,7 @@ mod tests {
             use_ckignore: false,
             exclude_patterns: vec![],
             show_hidden: false,
+            glob_patterns: vec![],
         };
 
         let files_all = collect_files(test_path, &options_both_disabled).unwrap();
