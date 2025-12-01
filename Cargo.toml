@@ -10,6 +10,7 @@ members = [
     "ck-ann",
     "ck-models",
     "ck-tui",
+    "ck-trigram",
 ]
 
 [workspace.package]
@@ -65,3 +66,7 @@ bytemuck = { version = "1.14", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 futures-util = "0.3"
 indicatif = "0.17"
+
+# Trigram indexing
+roaring = "0.10"
+regex-syntax = "0.8"

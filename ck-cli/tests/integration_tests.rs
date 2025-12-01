@@ -821,3 +821,88 @@ fn test_add_file_with_relative_path() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("Relative path content"));
 }
+
+#[test]
+#[serial]
+fn test_trigram_index_accelerates_regex_search() {
+    let temp_dir = TempDir::new().unwrap();
+
+    // Create multiple files, only some containing our search term
+    for i in 0..20 {
+        let content = if i % 5 == 0 {
+            format!("File {} contains UniqueSearchTerm here\n", i)
+        } else {
+            format!("File {} has other content only\n", i)
+        };
+        fs::write(temp_dir.path().join(format!("file{}.txt", i)), content).unwrap();
+    }
+
+    // First, index to build trigram index
+    let output = Command::new(ck_binary())
+        .args(["--index", "."])
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("Failed to run ck --index");
+
+    assert!(
+        output.status.success(),
+        "Indexing failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify trigram index was created
+    let trigram_path = temp_dir.path().join(".ck").join("trigrams.bin");
+    assert!(
+        trigram_path.exists(),
+        "Trigram index should be created at {:?}",
+        trigram_path
+    );
+
+    // Search for the unique term - should find only files 0, 5, 10, 15
+    let output = Command::new(ck_binary())
+        .args(["UniqueSearchTerm", "."])
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("Failed to run regex search");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    // Should find matches in files 0, 5, 10, 15
+    assert!(stdout.contains("file0.txt"), "Should find match in file0.txt");
+    assert!(stdout.contains("file5.txt"), "Should find match in file5.txt");
+    assert!(stdout.contains("file10.txt"), "Should find match in file10.txt");
+    assert!(stdout.contains("file15.txt"), "Should find match in file15.txt");
+
+    // Should NOT find matches in other files
+    assert!(!stdout.contains("file1.txt"), "Should not match file1.txt");
+    assert!(!stdout.contains("file2.txt"), "Should not match file2.txt");
+}
+
+#[test]
+#[serial]
+fn test_trigram_index_falls_back_for_short_patterns() {
+    let temp_dir = TempDir::new().unwrap();
+
+    fs::write(temp_dir.path().join("test.txt"), "ab test content\n").unwrap();
+
+    // Index first
+    let output = Command::new(ck_binary())
+        .args(["--index", "."])
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("Failed to run ck --index");
+
+    assert!(output.status.success());
+
+    // Search for short pattern (< 3 chars) - should still work via full scan
+    let output = Command::new(ck_binary())
+        .args(["ab", "."])
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("Failed to run regex search");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("ab test content"));
+}

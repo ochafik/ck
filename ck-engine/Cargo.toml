@@ -17,6 +17,7 @@ ck-embed = { version = "0.7.1", path = "../ck-embed" }
 ck-ann = { version = "0.7.1", path = "../ck-ann" }
 ck-chunk = { version = "0.7.1", path = "../ck-chunk" }
 ck-models = { version = "0.7.1", path = "../ck-models" }
+ck-trigram = { version = "0.7.1", path = "../ck-trigram" }
 serde_json = { workspace = true }
 
 anyhow = { workspace = true }
