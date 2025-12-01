@@ -17,6 +17,7 @@ ck-models = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 
 fastembed = { workspace = true, optional = true }
 hf-hub = { workspace = true, optional = true }
@@ -26,8 +27,15 @@ once_cell = { workspace = true, optional = true }
 ndarray = { workspace = true, optional = true }
 num_cpus = { workspace = true, optional = true }
 
+# Static embeddings support (model2vec-style, distinct from the mixedbread ONNX path above)
+safetensors = { workspace = true, optional = true }
+bytemuck = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+indicatif = { workspace = true, optional = true }
+
 [features]
-default = ["fastembed", "mixedbread"]
+default = ["fastembed", "mixedbread", "static-embeddings"]
 fastembed = ["dep:fastembed"]
 mixedbread = [
     "dep:hf-hub",
@@ -36,4 +44,13 @@ mixedbread = [
     "dep:once_cell",
     "dep:ndarray",
     "dep:num_cpus",
+]
+# static-embeddings only needs tokenizers (shared with mixedbread) plus its own deps
+static-embeddings = [
+    "dep:tokenizers",
+    "dep:safetensors",
+    "dep:bytemuck",
+    "dep:reqwest",
+    "dep:futures-util",
+    "dep:indicatif",
 ]

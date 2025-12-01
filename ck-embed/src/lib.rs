@@ -5,12 +5,22 @@ use std::path::Path;
 #[cfg(any(feature = "fastembed", feature = "mixedbread"))]
 use std::path::PathBuf;
 
+pub mod model_downloader;
 pub mod reranker;
+pub mod static_embedder;
 pub mod tokenizer;
 
+pub use model_downloader::{
+    download_static_model, ensure_model_downloaded, get_model_cache_dir, get_model_path,
+    is_model_downloaded,
+};
 pub use reranker::{
     RerankResult, Reranker, create_reranker, create_reranker_for_config,
     create_reranker_with_progress,
+};
+pub use static_embedder::{
+    MRL_DIMENSIONS, STATIC_RETRIEVAL_EN, STATIC_SIMILARITY_MULTILINGUAL, StaticEmbedder,
+    is_static_model, resolve_model_name,
 };
 pub use tokenizer::TokenEstimator;
 
@@ -43,6 +53,15 @@ pub(crate) fn model_cache_root() -> Result<PathBuf> {
     Ok(base.join("models"))
 }
 
+/// Options for creating an embedder
+#[derive(Default, Clone)]
+pub struct EmbedderOptions {
+    /// Model name or alias
+    pub model_name: Option<String>,
+    /// MRL dimension truncation (for static models)
+    pub truncate_dim: Option<usize>,
+}
+
 pub fn create_embedder(model_name: Option<&str>) -> Result<Box<dyn Embedder>> {
     create_embedder_with_progress(model_name, None)
 }
@@ -59,6 +78,15 @@ pub fn create_embedder_with_progress(
 #[allow(clippy::needless_return)]
 pub fn create_embedder_for_config(
     config: &ModelConfig,
+    progress_callback: Option<ModelDownloadCallback>,
+) -> Result<Box<dyn Embedder>> {
+    create_embedder_for_config_with_truncate_dim(config, None, progress_callback)
+}
+
+#[allow(clippy::needless_return)]
+fn create_embedder_for_config_with_truncate_dim(
+    config: &ModelConfig,
+    truncate_dim: Option<usize>,
     progress_callback: Option<ModelDownloadCallback>,
 ) -> Result<Box<dyn Embedder>> {
     match config.provider.as_str() {
@@ -81,6 +109,14 @@ pub fn create_embedder_for_config(
                 )));
             }
         }
+        "static" => {
+            let repo_id = resolve_model_name(&config.name);
+            return Ok(Box::new(StaticEmbedder::from_huggingface(
+                repo_id,
+                truncate_dim,
+                progress_callback,
+            )?));
+        }
         "mixedbread" => {
             #[cfg(feature = "mixedbread")]
             {
@@ -99,6 +135,29 @@ pub fn create_embedder_for_config(
         }
         provider => bail!("Unsupported embedding provider '{provider}'"),
     }
+}
+
+/// Create an embedder with full options support (model alias/name resolution via the
+/// registry, plus MRL dimension truncation for static models).
+pub fn create_embedder_with_options(
+    options: &EmbedderOptions,
+    progress_callback: Option<ModelDownloadCallback>,
+) -> Result<Box<dyn Embedder>> {
+    let registry = ModelRegistry::default();
+    let (_, config) = registry.resolve(options.model_name.as_deref())?;
+
+    // Fall back to legacy is_static_model()/resolve_model_name() detection in case a raw
+    // HuggingFace repo id (not present in the registry) was passed directly.
+    if config.provider == "static" || is_static_model(&config.name) {
+        let repo_id = resolve_model_name(&config.name);
+        return Ok(Box::new(StaticEmbedder::from_huggingface(
+            repo_id,
+            options.truncate_dim,
+            progress_callback,
+        )?));
+    }
+
+    create_embedder_for_config_with_truncate_dim(&config, options.truncate_dim, progress_callback)
 }
 
 pub struct DummyEmbedder {
