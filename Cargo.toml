@@ -10,6 +10,7 @@ members = [
     "ck-ann",
     "ck-models",
     "ck-tui",
+    "ck-trigram",
 ]
 
 [workspace.package]
@@ -57,3 +58,7 @@ pdf-extract = "0.9"
 uuid = { version = "1.8", features = ["v4", "serde"] }
 base64 = "0.22"
 sha2 = "0.10"
+
+# Trigram indexing
+roaring = "0.10"
+regex-syntax = "0.8"
