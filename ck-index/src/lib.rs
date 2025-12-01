@@ -79,6 +79,11 @@ pub fn request_interrupt() {
     INTERRUPTED.store(true, Ordering::SeqCst);
 }
 
+/// Check if an interrupt has been requested
+pub fn is_interrupted() -> bool {
+    INTERRUPTED.load(Ordering::SeqCst)
+}
+
 /// Build override patterns for including/excluding files during directory traversal
 ///
 /// # Arguments
@@ -153,6 +158,10 @@ pub struct IndexManifest {
     /// - v2 = blake3 of chunk text + leading_trivia + trailing_trivia
     #[serde(default)]
     pub chunk_hash_version: Option<u32>,
+    /// Glob patterns used to filter files during indexing
+    /// When set, auto-indexing during search uses these patterns
+    #[serde(default)]
+    pub glob_patterns: Option<Vec<String>>,
 }
 
 impl Default for IndexManifest {
@@ -170,6 +179,7 @@ impl Default for IndexManifest {
             embedding_model: None, // Default to None for backward compatibility
             embedding_dimensions: None,
             chunk_hash_version: Some(2), // v2 = blake3 of chunk text + trivia
+            glob_patterns: None,
         }
     }
 }
@@ -318,6 +328,11 @@ pub async fn index_directory(
     } else {
         None
     };
+
+    // Save glob patterns if explicitly set
+    if !options.glob_patterns.is_empty() {
+        manifest.glob_patterns = Some(options.glob_patterns.clone());
+    }
 
     let files = collect_files(path, options)?;
 
@@ -722,10 +737,16 @@ pub async fn smart_update_index_with_detailed_progress(
     let mut stats = UpdateStats::default();
 
     // Set up interrupt handler (only once per process)
+    // On second Ctrl+C, exit immediately
     HANDLER_INIT.call_once(|| {
         let _ = ctrlc::set_handler(move || {
+            if INTERRUPTED.load(Ordering::SeqCst) {
+                // Second interrupt - exit immediately
+                eprintln!("\nForced exit.");
+                std::process::exit(130); // Standard exit code for Ctrl+C
+            }
             INTERRUPTED.store(true, Ordering::SeqCst);
-            eprintln!("\nIndexing interrupted by user. Cleaning up...");
+            eprintln!("\nInterrupted. Press Ctrl+C again to force exit.");
         });
     });
 
@@ -811,9 +832,24 @@ pub async fn smart_update_index_with_detailed_progress(
         (None, None)
     };
 
+    // Handle glob patterns: save them when explicitly set, reuse existing when auto-indexing
+    let effective_options = if !options.glob_patterns.is_empty() {
+        // User explicitly specified glob patterns - save them to manifest
+        manifest.glob_patterns = Some(options.glob_patterns.clone());
+        options.clone()
+    } else if let Some(ref saved_globs) = manifest.glob_patterns {
+        // Auto-indexing during search: use saved patterns from manifest
+        let mut opts = options.clone();
+        opts.glob_patterns = saved_globs.clone();
+        opts
+    } else {
+        // No saved patterns and none specified - index all files
+        options.clone()
+    };
+
     // For incremental updates, only process files in the search scope
     // The cleanup phase already handled removing orphaned files from the entire repo
-    let current_files = collect_files(path, options)?;
+    let current_files = collect_files(path, &effective_options)?;
 
     // First pass: determine which files need updating and collect stats
     let mut files_to_update = Vec::new();

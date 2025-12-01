@@ -42,6 +42,10 @@ pub async fn semantic_search_v3_with_progress(
     let mut file_chunks: Vec<(std::path::PathBuf, ck_index::ChunkEntry)> = Vec::new();
 
     for entry in WalkDir::new(&index_dir) {
+        // Check for interrupt
+        if ck_index::is_interrupted() {
+            return Err(ck_core::CkError::Search("Search interrupted by user".to_string()).into());
+        }
         let entry = entry?;
         if entry.file_type().is_file() {
             let path = entry.path();
@@ -111,6 +115,10 @@ pub async fn semantic_search_v3_with_progress(
     let mut similarities: Vec<(f32, &std::path::PathBuf, &ck_index::ChunkEntry)> = Vec::new();
 
     for (file_path, chunk) in &file_chunks {
+        // Check for interrupt
+        if ck_index::is_interrupted() {
+            return Err(ck_core::CkError::Search("Search interrupted by user".to_string()).into());
+        }
         if let Some(ref embedding) = chunk.embedding {
             let similarity = cosine_similarity(query_embedding, embedding);
             similarities.push((similarity, file_path, chunk));
