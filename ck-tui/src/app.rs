@@ -602,6 +602,7 @@ impl TuiApp {
             files_without_matches: false,
             exclude_patterns,
             include_patterns: Vec::new(),
+            glob_patterns: Vec::new(),
             respect_gitignore: true,
             use_ckignore: true,
             full_section: false,

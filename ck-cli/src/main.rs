@@ -236,6 +236,14 @@ struct Cli {
     exclude: Vec<String>,
 
     #[arg(
+        short = 'g',
+        long = "glob",
+        value_name = "PATTERN",
+        help = "Include only files matching glob pattern (like ripgrep's -g). Can be used multiple times. Example: -g '*.md' -g '*.txt'"
+    )]
+    glob: Vec<String>,
+
+    #[arg(
         long = "no-default-excludes",
         help = "Disable default directory exclusions (like .git, node_modules, etc.)"
     )]
@@ -689,6 +697,7 @@ async fn run_index_workflow(
         respect_gitignore: !cli.no_ignore,
         use_ckignore: !cli.no_ckignore,
         exclude_patterns: exclude_patterns.clone(),
+        glob_patterns: cli.glob.clone(),
     };
     let index_future = ck_index::smart_update_index_with_detailed_progress(
         path,
@@ -1148,6 +1157,7 @@ async fn run_cli_mode(cli: Cli) -> Result<()> {
                 respect_gitignore: !cli.no_ignore,
                 use_ckignore: !cli.no_ckignore,
                 exclude_patterns: exclude_patterns.clone(),
+                glob_patterns: cli.glob.clone(),
             };
             let cleanup_stats = ck_index::cleanup_index(&clean_path, &file_options)?;
             status.finish_progress(cleanup_spinner, "Cleanup complete");
@@ -1534,6 +1544,7 @@ fn build_options(cli: &Cli, reindex: bool, repo_root: Option<&Path>) -> SearchOp
         files_without_matches: cli.files_without_matches,
         exclude_patterns,
         include_patterns: Vec::new(),
+        glob_patterns: cli.glob.clone(),
         respect_gitignore: !cli.no_ignore,
         use_ckignore: !cli.no_ckignore,
         full_section: cli.full_section,
