@@ -506,6 +506,11 @@ fn build_exclude_patterns(cli: &Cli) -> Vec<String> {
 /// Resolve the default threshold for semantic search based on the model being used.
 /// Reads from the index manifest if available, otherwise uses the CLI model or registry default.
 fn resolve_model_threshold(repo_root: Option<&Path>, cli_model: Option<&str>) -> f32 {
+    // For ensemble "all" mode, use no threshold (RRF handles ranking)
+    if cli_model == Some("all") {
+        return 0.0; // No threshold filtering for ensemble mode
+    }
+
     let registry = ck_models::ModelRegistry::default();
 
     // Try to get model from index manifest first (if we have a repo root)
@@ -1314,32 +1319,71 @@ async fn run_cli_mode(cli: Cli) -> Result<()> {
             let manifest_path = ck_core::index_dir(&status_path).join("manifest.json");
             if let Ok(data) = std::fs::read(&manifest_path)
                 && let Ok(manifest) = serde_json::from_slice::<ck_index::IndexManifest>(&data)
-                && let Some(model_name) = manifest.embedding_model
             {
                 let registry = ck_models::ModelRegistry::default();
-                let alias = registry
-                    .models
-                    .iter()
-                    .find(|(_, config)| config.name == model_name)
-                    .map(|(alias, _)| alias.clone())
-                    .unwrap_or_else(|| model_name.clone());
-                let dims = manifest
-                    .embedding_dimensions
-                    .or_else(|| {
-                        registry
-                            .models
-                            .iter()
-                            .find(|(_, config)| config.name == model_name)
-                            .map(|(_, config)| config.dimensions)
-                    })
-                    .unwrap_or(0);
 
-                if alias == model_name {
-                    status.info(&format!("  Model: {model_name} ({dims} dims)"));
-                } else {
-                    status.info(&format!(
-                        "  Model: {model_name} (alias '{alias}', {dims} dims)"
-                    ));
+                // Show all indexed models (from embedding_models field)
+                if !manifest.embedding_models.is_empty() {
+                    if manifest.embedding_models.len() == 1 {
+                        let model = &manifest.embedding_models[0];
+                        let display_alias = model.alias.as_ref()
+                            .or_else(|| registry.models.iter()
+                                .find(|(_, config)| config.name == model.name)
+                                .map(|(alias, _)| alias))
+                            .cloned();
+                        if let Some(alias) = display_alias && alias != model.name {
+                            status.info(&format!(
+                                "  Model: {} (alias '{}', {} dims)",
+                                model.name, alias, model.dimensions
+                            ));
+                        } else {
+                            status.info(&format!("  Model: {} ({} dims)", model.name, model.dimensions));
+                        }
+                    } else {
+                        status.info(&format!("  Models: {} indexed", manifest.embedding_models.len()));
+                        for model in &manifest.embedding_models {
+                            let display_alias = model.alias.as_ref()
+                                .or_else(|| registry.models.iter()
+                                    .find(|(_, config)| config.name == model.name)
+                                    .map(|(alias, _)| alias))
+                                .cloned();
+                            if let Some(alias) = display_alias && alias != model.name {
+                                status.info(&format!(
+                                    "    • {} (alias '{}', {} dims)",
+                                    model.name, alias, model.dimensions
+                                ));
+                            } else {
+                                status.info(&format!("    • {} ({} dims)", model.name, model.dimensions));
+                            }
+                        }
+                    }
+                } else if let Some(model_name) = &manifest.embedding_model {
+                    // Fall back to legacy single-model field
+                    let alias = registry
+                        .models
+                        .iter()
+                        .find(|(_, config)| config.name == *model_name)
+                        .map(|(alias, _)| alias.clone())
+                        .unwrap_or_else(|| model_name.clone());
+                    let dims = manifest
+                        .embedding_dimensions
+                        .or_else(|| {
+                            registry
+                                .models
+                                .iter()
+                                .find(|(_, config)| config.name == *model_name)
+                                .map(|(_, config)| config.dimensions)
+                        })
+                        .unwrap_or(0);
+
+                    if alias == *model_name {
+                        status.info(&format!("  Model: {} ({} dims)", model_name, dims));
+                    } else {
+                        status.info(&format!(
+                            "  Model: {} (alias '{}', {} dims)",
+                            model_name, alias, dims
+                        ));
+                    }
                 }
             }
 

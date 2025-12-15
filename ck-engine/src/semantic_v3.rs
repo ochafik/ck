@@ -37,8 +37,15 @@ pub async fn semantic_search_v3_with_progress(
     // via a CK_INDEX_DIR basename-hash collision. No-op in-tree.
     ck_core::check_index_root_marker(&index_root)?;
 
+    // Resolve the model early so we know which embeddings to look for
+    let resolved_model = resolve_model_from_root(&index_root, options.embedding_model.as_deref())?;
+    let model_name = resolved_model.canonical_name().to_string();
+
     if let Some(ref callback) = progress_callback {
-        callback("Loading embeddings from sidecar files...");
+        callback(&format!(
+            "Loading embeddings for model {} from sidecar files...",
+            resolved_model.alias
+        ));
     }
 
     // Build the path scope filter once, up front. Previously this was
@@ -72,7 +79,8 @@ pub async fn semantic_search_v3_with_progress(
                             continue;
                         }
                         for chunk in index_entry.chunks {
-                            if chunk.embedding.is_some() {
+                            // Check if this chunk has an embedding for the requested model
+                            if chunk.get_embedding(Some(&model_name)).is_some() {
                                 file_chunks.push((original_file.clone(), chunk));
                             }
                         }
@@ -91,17 +99,14 @@ pub async fn semantic_search_v3_with_progress(
 
     if let Some(ref callback) = progress_callback {
         callback(&format!(
-            "Found {} chunks with embeddings",
-            file_chunks.len()
+            "Found {} chunks with embeddings for model {}",
+            file_chunks.len(),
+            resolved_model.alias
         ));
     }
 
-    // Create embedder and embed the query
-    if let Some(ref callback) = progress_callback {
-        callback("Loading embedding model...");
-    }
-
-    let resolved_model = resolve_model_from_root(&index_root, options.embedding_model.as_deref())?;
+    // Create embedder and embed the query. The model was already resolved up
+    // front (so we knew which per-chunk embeddings to collect above).
     if let Some(ref callback) = progress_callback {
         if resolved_model.alias == resolved_model.canonical_name() {
             callback(&format!(
@@ -143,7 +148,8 @@ pub async fn semantic_search_v3_with_progress(
         if ck_index::is_interrupted() {
             return Err(ck_core::CkError::Search("Search interrupted by user".to_string()).into());
         }
-        if let Some(ref embedding) = chunk.embedding {
+        // Get embedding for the specific model (already filtered during collection, but double-check)
+        if let Some(embedding) = chunk.get_embedding(Some(&model_name)) {
             let similarity = cosine_similarity(query_embedding, embedding);
             similarities.push((similarity, file_path, chunk));
         }

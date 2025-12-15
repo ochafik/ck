@@ -13,7 +13,9 @@ use tantivy::schema::{STORED, Schema, TEXT, Value};
 use tantivy::{Index, ReloadPolicy, TantivyDocument, doc};
 use walkdir::WalkDir;
 
+mod ensemble;
 mod semantic_v3;
+pub use ensemble::{ensemble_search, ensemble_search_with_progress};
 pub use semantic_v3::{semantic_search_v3, semantic_search_v3_with_progress};
 
 pub type SearchProgressCallback = Box<dyn Fn(&str) + Send + Sync>;
@@ -312,7 +314,25 @@ fn legacy_model_config(name: &str, dimensions: usize) -> ck_models::ModelConfig 
         dimensions,
         max_tokens: 8192,
         description: "Legacy ck embedding model preserved for backwards compatibility".to_string(),
+        mrl_dims: None,
+        default_threshold: 0.6,
     }
+}
+
+/// Resolve `key` (an alias or a full model name) to its registry entry.
+fn find_model_entry<'a>(
+    registry: &'a ck_models::ModelRegistry,
+    key: &str,
+) -> Option<(String, &'a ck_models::ModelConfig)> {
+    if let Some(config) = registry.get_model(key) {
+        return Some((key.to_string(), config));
+    }
+
+    registry
+        .models
+        .iter()
+        .find(|(_, config)| config.name == key)
+        .map(|(alias, config)| (alias.clone(), config))
 }
 
 pub(crate) fn resolve_model_from_root(
@@ -321,52 +341,91 @@ pub(crate) fn resolve_model_from_root(
 ) -> Result<ResolvedModel> {
     use ck_models::ModelRegistry;
 
+    // Special case: "all" means ensemble search, return a placeholder
+    // The actual model resolution happens per-model in ensemble search
+    if cli_model == Some("all") {
+        return Ok(ResolvedModel {
+            alias: "all".to_string(),
+            config: legacy_model_config("all", 0), // Not used for ensemble
+        });
+    }
+
     let registry = ModelRegistry::default();
     let index_dir = ck_core::index_dir(index_root);
     let manifest_path = index_dir.join("manifest.json");
+
+    // Helper to resolve a model name (alias or full name) to a ResolvedModel,
+    // optionally overriding the dimensions with a value recorded in the
+    // manifest (e.g. for MRL-truncated static models).
+    let resolve_model = |model_name: &str, dims: Option<usize>| -> Option<ResolvedModel> {
+        let (alias, config_opt) = find_model_entry(&registry, model_name)
+            .map(|(alias, config)| (alias, Some(config.clone())))
+            .unwrap_or_else(|| (model_name.to_string(), None));
+        let mut config =
+            config_opt.unwrap_or_else(|| legacy_model_config(model_name, dims.unwrap_or(384)));
+        if let Some(d) = dims {
+            config.dimensions = d;
+        }
+        Some(ResolvedModel { alias, config })
+    };
 
     if manifest_path.exists() {
         let data = std::fs::read(&manifest_path)?;
         let manifest: ck_index::IndexManifest = serde_json::from_slice(&data)?;
 
-        if let Some(existing_model) = manifest.embedding_model {
-            let dims_hint = manifest.embedding_dimensions.unwrap_or(384);
-            let resolved_existing = match registry.resolve(Some(existing_model.as_str())) {
-                Ok((alias, config)) => ResolvedModel { alias, config },
-                Err(_) => ResolvedModel {
-                    alias: existing_model.clone(),
-                    config: legacy_model_config(&existing_model, dims_hint),
-                },
-            };
+        // Get list of available indexed models (check both new and legacy fields)
+        let indexed_models = manifest.get_indexed_models();
 
-            if let Some(requested) = cli_model {
-                let (requested_alias, requested_config) = registry
-                    .resolve(Some(requested))
-                    .map_err(|e| CkError::Embedding(e.to_string()))?;
+        if let Some(requested) = cli_model {
+            // User requested a specific model. Multi-model support means this
+            // never errors on mismatch — if the model isn't indexed yet, the
+            // auto-update path re-embeds the corpus for it alongside any
+            // models that are already indexed.
+            let (requested_alias, requested_config) = registry
+                .resolve(Some(requested))
+                .map_err(|e| CkError::Embedding(e.to_string()))?;
 
-                if requested_config.name != resolved_existing.config.name {
-                    let suggested_alias = resolved_existing.alias.clone();
-                    return Err(CkError::Embedding(format!(
-                        "Index was built with embedding model '{}' (alias '{}'), but '--model {}' was requested. To switch models run `ck --clean .` then `ck --index --model {}`. To keep using this index rerun your command with '--model {}'.",
-                        resolved_existing.config.name,
-                        suggested_alias,
-                        requested,
-                        requested,
-                        suggested_alias
-                    ))
-                    .into());
+            // If this model is already indexed, honor its recorded dimensions
+            // (e.g. an MRL-truncated dimension) rather than the registry default.
+            let model_info = manifest
+                .embedding_models
+                .iter()
+                .find(|m| m.name == requested_config.name);
+            let dims = model_info
+                .map(|m| m.dimensions)
+                .unwrap_or(requested_config.dimensions);
+
+            let mut config = requested_config;
+            config.dimensions = dims;
+
+            return Ok(ResolvedModel {
+                alias: requested_alias,
+                config,
+            });
+        }
+
+        // No specific model requested - use first available indexed model
+        if !indexed_models.is_empty() {
+            // Prefer models from the new embedding_models field (has more info)
+            if let Some(model_info) = manifest.embedding_models.first() {
+                if let Some(resolved) = resolve_model(&model_info.name, Some(model_info.dimensions))
+                {
+                    return Ok(resolved);
                 }
-
-                return Ok(ResolvedModel {
-                    alias: requested_alias,
-                    config: requested_config,
-                });
             }
 
-            return Ok(resolved_existing);
+            // Fall back to legacy embedding_model field
+            if let Some(ref existing_model) = manifest.embedding_model {
+                if let Some(resolved) =
+                    resolve_model(existing_model, manifest.embedding_dimensions)
+                {
+                    return Ok(resolved);
+                }
+            }
         }
     }
 
+    // No indexed models found - use CLI model or default
     let (alias, config) = registry
         .resolve(cli_model)
         .map_err(|e| CkError::Embedding(e.to_string()))?;
@@ -470,9 +529,11 @@ pub async fn search_enhanced_with_outcome(
         .into());
     }
 
-    // Auto-update index if needed (unless it's regex-only mode)
+    // Auto-update index if needed (unless it's regex-only mode or ensemble "all" mode)
+    // For "all" mode, we use existing indexed models - no auto-indexing
     let mut index_update = None;
-    if !matches!(options.mode, SearchMode::Regex) {
+    let is_ensemble_mode = options.embedding_model.as_deref() == Some("all");
+    if !matches!(options.mode, SearchMode::Regex) && !is_ensemble_mode {
         let need_embeddings = matches!(options.mode, SearchMode::Semantic | SearchMode::Hybrid);
         let file_options = ck_core::FileCollectionOptions::from(options);
         let started = std::time::Instant::now();
@@ -515,8 +576,14 @@ pub async fn search_enhanced_with_outcome(
             }
         }
         SearchMode::Semantic => {
-            // Use v3 semantic search (reads pre-computed embeddings from sidecars using spans)
-            semantic_search_v3_with_progress(options, progress_callback).await?
+            // Check if user requested ensemble search across all models
+            if options.embedding_model.as_deref() == Some("all") {
+                // Ensemble search: query all indexed models and merge with RRF
+                ensemble_search_with_progress(options, progress_callback).await?
+            } else {
+                // Use v3 semantic search (reads pre-computed embeddings from sidecars using spans)
+                semantic_search_v3_with_progress(options, progress_callback).await?
+            }
         }
         SearchMode::Hybrid => {
             let matches = hybrid_search_with_progress(options, progress_callback).await?;

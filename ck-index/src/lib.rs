@@ -22,6 +22,8 @@ fn legacy_model_config(name: &str, dimensions: Option<usize>) -> ck_models::Mode
         dimensions: dimensions.unwrap_or(384),
         max_tokens: 8192,
         description: "Legacy ck embedding model (inferred from manifest)".to_string(),
+        mrl_dims: None,
+        default_threshold: 0.6,
     }
 }
 
@@ -134,7 +136,12 @@ pub struct IndexEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkEntry {
     pub span: Span,
+    /// Legacy single-model embedding (for backward compatibility)
+    #[serde(default)]
     pub embedding: Option<Vec<f32>>,
+    /// Multi-model embeddings: model_name -> embedding vector
+    #[serde(default)]
+    pub embeddings: HashMap<String, Vec<f32>>,
     pub chunk_type: Option<String>, // "function", "class", "method", or None for generic
     #[serde(default)]
     pub breadcrumb: Option<String>,
@@ -153,16 +160,62 @@ pub struct ChunkEntry {
     pub chunk_hash: Option<String>,
 }
 
+impl ChunkEntry {
+    /// Get embedding for a specific model, falling back to legacy embedding
+    pub fn get_embedding(&self, model: Option<&str>) -> Option<&Vec<f32>> {
+        if let Some(model_name) = model {
+            self.embeddings.get(model_name)
+        } else if !self.embeddings.is_empty() {
+            // Return first available embedding if no model specified
+            self.embeddings.values().next()
+        } else {
+            // Fall back to legacy single embedding
+            self.embedding.as_ref()
+        }
+    }
+
+    /// Get embedding for a model, with fallback chain
+    pub fn get_embedding_with_fallback(&self, preferred_model: Option<&str>) -> Option<&Vec<f32>> {
+        // Try preferred model first
+        if let Some(model) = preferred_model {
+            if let Some(emb) = self.embeddings.get(model) {
+                return Some(emb);
+            }
+        }
+        // Fall back to any available embedding
+        if !self.embeddings.is_empty() {
+            return self.embeddings.values().next();
+        }
+        // Finally, try legacy embedding
+        self.embedding.as_ref()
+    }
+}
+
+/// Information about an indexed embedding model
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelInfo {
+    pub name: String,
+    pub dimensions: usize,
+    /// Alias used when indexing (e.g., "bge-small" for "BAAI/bge-small-en-v1.5")
+    #[serde(default)]
+    pub alias: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexManifest {
     pub version: String,
     pub created: u64,
     pub updated: u64,
     pub files: HashMap<PathBuf, FileMetadata>,
-    /// Embedding model used for this index (added in v0.4.2+)
+    /// Legacy: Embedding model used for this index (for backward compatibility)
+    #[serde(default)]
     pub embedding_model: Option<String>,
-    /// Embedding model dimensions (for validation)
+    /// Legacy: Embedding model dimensions (for backward compatibility)
+    #[serde(default)]
     pub embedding_dimensions: Option<usize>,
+    /// Multi-model support: All embedding models indexed for this repository
+    #[serde(default)]
+    pub embedding_models: Vec<ModelInfo>,
     /// Chunk hash version for incremental indexing
     /// - v1 = blake3 of chunk text only
     /// - v2 = blake3 of chunk text + leading_trivia + trailing_trivia
@@ -172,6 +225,46 @@ pub struct IndexManifest {
     /// When set, auto-indexing during search uses these patterns
     #[serde(default)]
     pub glob_patterns: Option<Vec<String>>,
+}
+
+impl IndexManifest {
+    /// Get all indexed model names
+    pub fn get_indexed_models(&self) -> Vec<String> {
+        if !self.embedding_models.is_empty() {
+            self.embedding_models.iter().map(|m| m.name.clone()).collect()
+        } else if let Some(model) = &self.embedding_model {
+            vec![model.clone()]
+        } else {
+            vec![]
+        }
+    }
+
+    /// Check if a specific model is indexed
+    pub fn has_model(&self, model_name: &str) -> bool {
+        self.embedding_models.iter().any(|m| m.name == model_name || m.alias.as_deref() == Some(model_name))
+            || self.embedding_model.as_deref() == Some(model_name)
+    }
+
+    /// Add or update a model in the index
+    pub fn add_model(&mut self, name: String, dimensions: usize, alias: Option<String>) {
+        // Check if model already exists
+        if let Some(existing) = self.embedding_models.iter_mut().find(|m| m.name == name) {
+            existing.dimensions = dimensions;
+            existing.alias = alias;
+        } else {
+            self.embedding_models.push(ModelInfo { name, dimensions, alias });
+        }
+    }
+
+    /// Get the default/preferred model for searching
+    pub fn get_preferred_model(&self) -> Option<&str> {
+        // Prefer models in this order: first in embedding_models, then legacy embedding_model
+        if let Some(first) = self.embedding_models.first() {
+            Some(&first.name)
+        } else {
+            self.embedding_model.as_deref()
+        }
+    }
 }
 
 impl Default for IndexManifest {
@@ -186,8 +279,9 @@ impl Default for IndexManifest {
             created: now,
             updated: now,
             files: HashMap::new(),
-            embedding_model: None, // Default to None for backward compatibility
+            embedding_model: None, // Legacy field for backward compatibility
             embedding_dimensions: None,
+            embedding_models: Vec::new(),
             chunk_hash_version: Some(2), // v2 = blake3 of chunk text + trivia
             glob_patterns: None,
         }
@@ -354,18 +448,12 @@ async fn index_directory_inner(
             .resolve(model)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
-        if let Some(existing_model) = &manifest.embedding_model
-            && existing_model != &config.name
-        {
-            return Err(anyhow::anyhow!(
-                "Model mismatch: Index was created with '{}', but you're trying to use '{}'. \
-                Please run 'ck --clean {}' to remove the old index, then rerun with the new model.",
-                existing_model,
-                config.name,
-                path.display()
-            ));
-        }
+        // Multi-model support: register this model in the manifest's model list.
+        // No error on mismatch — indexing with an additional model re-embeds all
+        // files, adding embeddings for the new model alongside any existing ones.
+        manifest.add_model(config.name.clone(), config.dimensions, Some(alias.clone()));
 
+        // Keep the legacy single-model fields in sync for backward compatibility.
         manifest.embedding_model = Some(config.name.clone());
         manifest.embedding_dimensions = Some(config.dimensions);
 
@@ -899,7 +987,7 @@ pub async fn smart_update_index_with_detailed_progress(
     normalize_manifest_paths(&mut manifest, &repo_root);
 
     // Handle model configuration for embeddings
-    let resolved_model = if compute_embeddings {
+    let (resolved_model, is_new_model) = if compute_embeddings {
         let model_registry = ck_models::ModelRegistry::default();
 
         let resolved = if let Some(requested) = model {
@@ -920,24 +1008,23 @@ pub async fn smart_update_index_with_detailed_progress(
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?
         };
 
-        if let Some(existing_model) = &manifest.embedding_model
-            && existing_model != &resolved.1.name
-        {
-            return Err(anyhow::anyhow!(
-                "Model mismatch: Index was created with '{}', but you're trying to use '{}'. \
-                    Please run 'ck --clean .' to remove the old index, then 'ck --index --model {}' to rebuild with the new model.",
-                existing_model,
-                resolved.1.name,
-                model.unwrap_or("default")
-            ));
-        }
+        // Multi-model support: track whether this model is new to the index so
+        // the caller can decide whether a full re-embed pass is needed below.
+        let is_new_model = !manifest.has_model(&resolved.1.name);
 
+        // Multi-model support: register the model instead of erroring on
+        // mismatch — multiple models are allowed to coexist in the same index.
+        manifest.add_model(
+            resolved.1.name.clone(),
+            resolved.1.dimensions,
+            Some(resolved.0.clone()),
+        );
         manifest.embedding_model = Some(resolved.1.name.clone());
         manifest.embedding_dimensions = Some(resolved.1.dimensions);
 
-        Some(resolved)
+        (Some(resolved), is_new_model)
     } else {
-        None
+        (None, false)
     };
 
     // Handle glob patterns: save them when explicitly set, reuse existing when auto-indexing
@@ -963,70 +1050,96 @@ pub async fn smart_update_index_with_detailed_progress(
     let mut files_to_update = Vec::new();
     let mut manifest_changed = false;
 
-    for file_path in current_files {
-        // Check for interrupt
-        if INTERRUPTED.load(Ordering::SeqCst) {
-            eprintln!("Indexing interrupted during file scanning.");
-            return Ok(stats);
-        }
-
-        let manifest_key =
-            path_utils::to_manifest_path(&path_utils::to_standard_path(&file_path, &repo_root));
-
-        if let Some(metadata) = manifest.files.get(&manifest_key) {
-            let fs_meta = match fs::metadata(&file_path) {
-                Ok(m) => m,
-                Err(_) => {
-                    stats.files_errored += 1;
-                    continue;
-                }
-            };
-
-            let fs_last_modified = match fs_meta.modified().and_then(|m| {
-                m.duration_since(SystemTime::UNIX_EPOCH)
-                    .map_err(|_| std::io::Error::other("Time error"))
-            }) {
-                Ok(dur) => dur.as_secs(),
-                Err(_) => {
-                    stats.files_errored += 1;
-                    continue;
-                }
-            };
-            let fs_size = fs_meta.len();
-
-            if fs_last_modified == metadata.last_modified && fs_size == metadata.size {
-                stats.files_up_to_date += 1;
-                continue;
+    // If adding a NEW model, we need to re-embed ALL files for that model
+    // The chunk-level caching will preserve existing embeddings from other models
+    if is_new_model {
+        tracing::info!(
+            "New embedding model detected - will embed all {} files",
+            current_files.len()
+        );
+        for file_path in current_files {
+            if INTERRUPTED.load(Ordering::SeqCst) {
+                eprintln!("Indexing interrupted during file scanning.");
+                return Ok(stats);
             }
-
-            let hash = match compute_file_hash(&file_path) {
-                Ok(h) => h,
-                Err(_) => {
-                    stats.files_errored += 1;
-                    continue;
-                }
-            };
-
-            if hash != metadata.hash {
-                stats.files_modified += 1;
-                files_to_update.push(file_path);
+            // For new model, we need to process all files
+            // But we still track stats based on manifest state
+            let manifest_key =
+                path_utils::to_manifest_path(&path_utils::to_standard_path(&file_path, &repo_root));
+            if manifest.files.contains_key(&manifest_key) {
+                stats.files_modified += 1; // Re-embedding existing file with new model
             } else {
-                stats.files_up_to_date += 1;
-                // Convert to standardized path for manifest storage
-                let standard_path = path_utils::to_standard_path(&file_path, &repo_root);
-                let manifest_path = path_utils::to_manifest_path(&standard_path);
-                let new_metadata = FileMetadata {
-                    path: manifest_path.clone(),
-                    hash,
-                    last_modified: fs_last_modified,
-                    size: fs_size,
-                };
-                manifest.files.insert(manifest_path, new_metadata);
-                manifest_changed = true;
+                stats.files_added += 1;
             }
-        } else {
-            stats.files_added += 1;
             files_to_update.push(file_path);
+        }
+    } else {
+        // Normal incremental update - only process changed files
+        for file_path in current_files {
+            // Check for interrupt
+            if INTERRUPTED.load(Ordering::SeqCst) {
+                eprintln!("Indexing interrupted during file scanning.");
+                return Ok(stats);
+            }
+
+            let manifest_key =
+                path_utils::to_manifest_path(&path_utils::to_standard_path(&file_path, &repo_root));
+
+            if let Some(metadata) = manifest.files.get(&manifest_key) {
+                let fs_meta = match fs::metadata(&file_path) {
+                    Ok(m) => m,
+                    Err(_) => {
+                        stats.files_errored += 1;
+                        continue;
+                    }
+                };
+
+                let fs_last_modified = match fs_meta.modified().and_then(|m| {
+                    m.duration_since(SystemTime::UNIX_EPOCH)
+                        .map_err(|_| std::io::Error::other("Time error"))
+                }) {
+                    Ok(dur) => dur.as_secs(),
+                    Err(_) => {
+                        stats.files_errored += 1;
+                        continue;
+                    }
+                };
+                let fs_size = fs_meta.len();
+
+                if fs_last_modified == metadata.last_modified && fs_size == metadata.size {
+                    stats.files_up_to_date += 1;
+                    continue;
+                }
+
+                let hash = match compute_file_hash(&file_path) {
+                    Ok(h) => h,
+                    Err(_) => {
+                        stats.files_errored += 1;
+                        continue;
+                    }
+                };
+
+                if hash != metadata.hash {
+                    stats.files_modified += 1;
+                    files_to_update.push(file_path);
+                } else {
+                    stats.files_up_to_date += 1;
+                    // Convert to standardized path for manifest storage
+                    let standard_path = path_utils::to_standard_path(&file_path, &repo_root);
+                    let manifest_path = path_utils::to_manifest_path(&standard_path);
+                    let new_metadata = FileMetadata {
+                        path: manifest_path.clone(),
+                        hash,
+                        last_modified: fs_last_modified,
+                        size: fs_size,
+                    };
+                    manifest.files.insert(manifest_path, new_metadata);
+                    manifest_changed = true;
+                }
+            } else {
+                stats.files_added += 1;
+                files_to_update.push(file_path);
+            }
         }
     }
 
@@ -1239,28 +1352,47 @@ fn index_single_file_with_progress(
     }
 
     // Build chunk cache from old sidecar if it exists (for chunk reuse)
-    let chunk_cache: HashMap<String, Vec<f32>> = if embedder.is_some() {
+    // chunk_cache: maps chunk_hash -> embedding for the CURRENT model
+    // old_chunks_by_hash: maps chunk_hash -> old ChunkEntry (to preserve other models' embeddings)
+    let (chunk_cache, old_chunks_by_hash): (
+        HashMap<String, Vec<f32>>,
+        HashMap<String, ChunkEntry>,
+    ) = if let Some(ref emb) = embedder {
+        let model_name = emb.model_name();
         let sidecar_path = get_sidecar_path(repo_root, file_path);
         if sidecar_path.exists() {
             match load_index_entry(&sidecar_path) {
-                Ok(old_entry) => old_entry
-                    .chunks
-                    .into_iter()
-                    .filter_map(|chunk| {
-                        if let (Some(hash), Some(embedding)) = (chunk.chunk_hash, chunk.embedding) {
-                            Some((hash, embedding))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect(),
-                Err(_) => HashMap::new(),
+                Ok(old_entry) => {
+                    let cache = old_entry
+                        .chunks
+                        .iter()
+                        .filter_map(|chunk| {
+                            let hash = chunk.chunk_hash.as_ref()?;
+                            // First check multi-model embeddings HashMap
+                            if let Some(emb) = chunk.embeddings.get(model_name) {
+                                return Some((hash.clone(), emb.clone()));
+                            }
+                            // Fall back to legacy embedding field
+                            chunk.embedding.as_ref().map(|e| (hash.clone(), e.clone()))
+                        })
+                        .collect();
+                    // Build map from chunk_hash -> old ChunkEntry for preserving other models
+                    let old_by_hash = old_entry
+                        .chunks
+                        .into_iter()
+                        .filter_map(|chunk| {
+                            chunk.chunk_hash.clone().map(|h| (h, chunk))
+                        })
+                        .collect();
+                    (cache, old_by_hash)
+                }
+                Err(_) => (HashMap::new(), HashMap::new()),
             }
         } else {
-            HashMap::new()
+            (HashMap::new(), HashMap::new())
         }
     } else {
-        HashMap::new()
+        (HashMap::new(), HashMap::new())
     };
 
     // Preprocess file (extracts PDFs to cache, returns path to readable content)
@@ -1396,9 +1528,18 @@ fn index_single_file_with_progress(
                     Some(chunk.metadata.trailing_trivia.clone())
                 };
 
+                // Store embedding in multi-model HashMap, preserving other models' embeddings
+                let model_name_str = embedder.model_name().to_string();
+                let mut embeddings_map = old_chunks_by_hash
+                    .get(&chunk_hash)
+                    .map(|old| old.embeddings.clone())
+                    .unwrap_or_default();
+                embeddings_map.insert(model_name_str, embedding.clone());
+
                 chunk_entries.push(ChunkEntry {
                     span: chunk.span,
-                    embedding: Some(embedding),
+                    embedding: Some(embedding), // Legacy field for backward compat
+                    embeddings: embeddings_map, // Multi-model support (preserves other models)
                     chunk_type: chunk_type_str,
                     breadcrumb,
                     ancestry,
@@ -1506,9 +1647,18 @@ fn index_single_file_with_progress(
                     } else {
                         Some(chunk.metadata.trailing_trivia.clone())
                     };
+                    // Store embedding in multi-model HashMap, preserving other models' embeddings
+                    let model_name_str = embedder.model_name().to_string();
+                    let mut embeddings_map = old_chunks_by_hash
+                        .get(&chunk_hash)
+                        .map(|old| old.embeddings.clone())
+                        .unwrap_or_default();
+                    embeddings_map.insert(model_name_str, embedding.clone());
+
                     ChunkEntry {
                         span: chunk.span,
-                        embedding: Some(embedding),
+                        embedding: Some(embedding), // Legacy field for backward compat
+                        embeddings: embeddings_map, // Multi-model support (preserves other models)
                         chunk_type: chunk_type_str,
                         breadcrumb,
                         ancestry,
@@ -1552,6 +1702,7 @@ fn index_single_file_with_progress(
                 ChunkEntry {
                     span: chunk.span,
                     embedding: None,
+                    embeddings: HashMap::new(), // No embeddings without embedder
                     chunk_type: chunk_type_str,
                     breadcrumb,
                     ancestry,

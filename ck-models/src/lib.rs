@@ -132,6 +132,8 @@ impl Default for ModelRegistry {
                 dimensions: 384,
                 max_tokens: 4096,
                 description: "Mixedbread xsmall embedding model (4k context, 384 dims) optimized for local semantic search".to_string(),
+                mrl_dims: None,
+                default_threshold: 0.6,
             },
         );
 
