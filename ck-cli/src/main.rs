@@ -1326,34 +1326,59 @@ async fn run_cli_mode(cli: Cli) -> Result<()> {
                 if !manifest.embedding_models.is_empty() {
                     if manifest.embedding_models.len() == 1 {
                         let model = &manifest.embedding_models[0];
-                        let display_alias = model.alias.as_ref()
-                            .or_else(|| registry.models.iter()
-                                .find(|(_, config)| config.name == model.name)
-                                .map(|(alias, _)| alias))
+                        let display_alias = model
+                            .alias
+                            .as_ref()
+                            .or_else(|| {
+                                registry
+                                    .models
+                                    .iter()
+                                    .find(|(_, config)| config.name == model.name)
+                                    .map(|(alias, _)| alias)
+                            })
                             .cloned();
-                        if let Some(alias) = display_alias && alias != model.name {
+                        if let Some(alias) = display_alias
+                            && alias != model.name
+                        {
                             status.info(&format!(
                                 "  Model: {} (alias '{}', {} dims)",
                                 model.name, alias, model.dimensions
                             ));
                         } else {
-                            status.info(&format!("  Model: {} ({} dims)", model.name, model.dimensions));
+                            status.info(&format!(
+                                "  Model: {} ({} dims)",
+                                model.name, model.dimensions
+                            ));
                         }
                     } else {
-                        status.info(&format!("  Models: {} indexed", manifest.embedding_models.len()));
+                        status.info(&format!(
+                            "  Models: {} indexed",
+                            manifest.embedding_models.len()
+                        ));
                         for model in &manifest.embedding_models {
-                            let display_alias = model.alias.as_ref()
-                                .or_else(|| registry.models.iter()
-                                    .find(|(_, config)| config.name == model.name)
-                                    .map(|(alias, _)| alias))
+                            let display_alias = model
+                                .alias
+                                .as_ref()
+                                .or_else(|| {
+                                    registry
+                                        .models
+                                        .iter()
+                                        .find(|(_, config)| config.name == model.name)
+                                        .map(|(alias, _)| alias)
+                                })
                                 .cloned();
-                            if let Some(alias) = display_alias && alias != model.name {
+                            if let Some(alias) = display_alias
+                                && alias != model.name
+                            {
                                 status.info(&format!(
                                     "    • {} (alias '{}', {} dims)",
                                     model.name, alias, model.dimensions
                                 ));
                             } else {
-                                status.info(&format!("    • {} ({} dims)", model.name, model.dimensions));
+                                status.info(&format!(
+                                    "    • {} ({} dims)",
+                                    model.name, model.dimensions
+                                ));
                             }
                         }
                     }

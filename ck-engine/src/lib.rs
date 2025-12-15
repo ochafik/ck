@@ -416,8 +416,7 @@ pub(crate) fn resolve_model_from_root(
 
             // Fall back to legacy embedding_model field
             if let Some(ref existing_model) = manifest.embedding_model {
-                if let Some(resolved) =
-                    resolve_model(existing_model, manifest.embedding_dimensions)
+                if let Some(resolved) = resolve_model(existing_model, manifest.embedding_dimensions)
                 {
                     return Ok(resolved);
                 }

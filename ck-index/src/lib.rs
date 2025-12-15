@@ -231,7 +231,10 @@ impl IndexManifest {
     /// Get all indexed model names
     pub fn get_indexed_models(&self) -> Vec<String> {
         if !self.embedding_models.is_empty() {
-            self.embedding_models.iter().map(|m| m.name.clone()).collect()
+            self.embedding_models
+                .iter()
+                .map(|m| m.name.clone())
+                .collect()
         } else if let Some(model) = &self.embedding_model {
             vec![model.clone()]
         } else {
@@ -241,7 +244,9 @@ impl IndexManifest {
 
     /// Check if a specific model is indexed
     pub fn has_model(&self, model_name: &str) -> bool {
-        self.embedding_models.iter().any(|m| m.name == model_name || m.alias.as_deref() == Some(model_name))
+        self.embedding_models
+            .iter()
+            .any(|m| m.name == model_name || m.alias.as_deref() == Some(model_name))
             || self.embedding_model.as_deref() == Some(model_name)
     }
 
@@ -252,7 +257,11 @@ impl IndexManifest {
             existing.dimensions = dimensions;
             existing.alias = alias;
         } else {
-            self.embedding_models.push(ModelInfo { name, dimensions, alias });
+            self.embedding_models.push(ModelInfo {
+                name,
+                dimensions,
+                alias,
+            });
         }
     }
 
@@ -1380,9 +1389,7 @@ fn index_single_file_with_progress(
                     let old_by_hash = old_entry
                         .chunks
                         .into_iter()
-                        .filter_map(|chunk| {
-                            chunk.chunk_hash.clone().map(|h| (h, chunk))
-                        })
+                        .filter_map(|chunk| chunk.chunk_hash.clone().map(|h| (h, chunk)))
                         .collect();
                     (cache, old_by_hash)
                 }

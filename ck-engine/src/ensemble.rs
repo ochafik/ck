@@ -31,10 +31,9 @@ pub async fn ensemble_search_with_progress(
 
     let manifest_path = index_root.join(".ck").join("manifest.json");
     if !manifest_path.exists() {
-        return Err(ck_core::CkError::Index(
-            "No index found. Run 'ck --index' first.".to_string(),
-        )
-        .into());
+        return Err(
+            ck_core::CkError::Index("No index found. Run 'ck --index' first.".to_string()).into(),
+        );
     }
 
     let manifest_data = std::fs::read(&manifest_path)?;
@@ -169,10 +168,10 @@ mod tests {
         SearchResult {
             file: PathBuf::from(file),
             span: Span {
-                start_line: line,
-                end_line: line + 10,
-                start_col: 0,
-                end_col: 0,
+                byte_start: 0,
+                byte_end: 100,
+                line_start: line,
+                line_end: line + 10,
             },
             score,
             preview: format!("Preview for {}", file),
