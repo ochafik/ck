@@ -1330,7 +1330,10 @@ pub async fn smart_update_index_with_detailed_progress(
     if should_update_trigrams
         && let Err(e) = build_trigram_index(&repo_root, &manifest, &files_to_update, &[])
     {
-        tracing::warn!("Failed to build trigram index: {}", e);
+        // Use the alternate/debug formatters so the full anyhow context chain
+        // (including the underlying io::Error, with its ErrorKind/errno) is
+        // logged instead of just the outermost "Failed to ..." context string.
+        tracing::warn!("Failed to build trigram index: {:#} ({:?})", e, e);
         // Don't fail the whole indexing operation for trigram index errors
     }
 
@@ -2669,7 +2672,16 @@ pub fn build_trigram_index(
     files_updated: &[PathBuf],
     files_removed: &[PathBuf],
 ) -> Result<()> {
-    let index_dir = repo_root.join(".ck");
+    // Use the same CK_INDEX_DIR-aware resolution as the manifest/sidecars/lock
+    // (ck_core::index_dir), not a raw `.join(".ck")` — otherwise, when
+    // CK_INDEX_DIR is set, this writes into a relocated directory that only
+    // the manifest path ever creates, and the trigram write fails with
+    // ENOENT the moment nothing else has created it yet (e.g. the very first
+    // index run under CK_INDEX_DIR, or for a subdirectory of an
+    // already-indexed root that hasn't been created via a call scoped to
+    // exactly `repo_root`).
+    let index_dir = ck_core::index_dir(repo_root);
+    fs::create_dir_all(&index_dir)?;
     let trigram_path = get_trigram_index_path(&index_dir);
 
     // Load existing index or create new one
