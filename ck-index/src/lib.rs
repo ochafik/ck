@@ -2156,6 +2156,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
+    // Sensitive to CK_INDEX_DIR (via smart_update_index -> ck_core::index_dir):
+    // must not run concurrently with test_trigram_index_respects_ck_index_dir,
+    // which mutates that process-global env var mid-test.
     async fn test_smart_update_index() {
         let temp_dir = TempDir::new().unwrap();
         let test_path = temp_dir.path();
@@ -2201,6 +2205,65 @@ mod tests {
         assert_eq!(stats4.files_added, 1);
         assert_eq!(stats4.files_up_to_date, 1);
         assert_eq!(stats4.files_indexed, 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_trigram_index_respects_ck_index_dir() {
+        // Regression test: build_trigram_index() used to resolve its target
+        // directory as a raw `repo_root.join(".ck")`, bypassing
+        // ck_core::index_dir()'s CK_INDEX_DIR relocation that the manifest,
+        // sidecars, and lock file all go through. Under CK_INDEX_DIR nothing
+        // else ever created that in-tree `.ck` path, so the trigram write
+        // failed with ENOENT on every index run — silently, since the
+        // manifest/sidecar indexing itself succeeded via the correctly
+        // relocated directory. See SYNC-NOTES.md for the live repro.
+        unsafe { std::env::remove_var(ck_core::INDEX_DIR_ENV) };
+        let relocation_base = TempDir::new().unwrap();
+        unsafe { std::env::set_var(ck_core::INDEX_DIR_ENV, relocation_base.path()) };
+
+        let source = TempDir::new().unwrap();
+        let source_path = source.path();
+        fs::write(
+            source_path.join("needle.txt"),
+            "a UniqueTrigramNeedle string to search for\n",
+        )
+        .unwrap();
+
+        let file_options = ck_core::FileCollectionOptions::default();
+        let result = smart_update_index(source_path, false, &file_options).await;
+
+        let relocated_dir = ck_core::index_dir(source_path);
+        unsafe { std::env::remove_var(ck_core::INDEX_DIR_ENV) };
+
+        let stats = result.expect("indexing under CK_INDEX_DIR should succeed");
+        assert_eq!(stats.files_added, 1);
+
+        // No in-tree `.ck` should ever have been created — that's the whole
+        // point of CK_INDEX_DIR.
+        assert!(
+            !source_path.join(".ck").exists(),
+            "CK_INDEX_DIR should keep the index fully out of the source tree"
+        );
+
+        // The trigram index must land under the relocated directory instead
+        // of silently failing to write (the ENOENT bug this test guards
+        // against).
+        let trigram_path = get_trigram_index_path(&relocated_dir);
+        assert!(
+            trigram_path.exists(),
+            "trigrams.bin should be written under the CK_INDEX_DIR-relocated \
+             directory {relocated_dir:?}, but it does not exist there"
+        );
+
+        // And it should actually be usable: load it back and confirm the
+        // indexed file round-tripped into it.
+        let trigram_index = ck_trigram::TrigramIndex::load_or_new(&trigram_path, false);
+        assert_eq!(
+            trigram_index.file_count(),
+            1,
+            "trigram index loaded from the relocated path should contain the indexed file"
+        );
     }
 
     #[test]
